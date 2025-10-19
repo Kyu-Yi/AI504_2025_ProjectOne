@@ -1,5 +1,5 @@
-# === AI504 Project 1: Single-file trainer that saves raw logits ===
-# Rename this file to your exact student ID, e.g., 202412345.py
+# AI504 Project 1
+# Make sure file is named afert StudentID, e.g., 202412345.py
 
 import os
 import random
