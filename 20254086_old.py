@@ -26,12 +26,12 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# Data and Transforms
+# Data & Transforms
 def build_transforms(dataset: str, image_size: int, grayscale_to_rgb: bool):
     imagenet_mean = (0.485, 0.456, 0.406)
     imagenet_std = (0.229, 0.224, 0.225)
 
-    # Enhanced training augmentation
+    # more enhacned training augmentation
     train_base = []
     if grayscale_to_rgb and dataset.lower() in {"fashion_mnist", "mnist"}:
         train_base.append(transforms.Grayscale(num_output_channels=3))
@@ -49,7 +49,7 @@ def build_transforms(dataset: str, image_size: int, grayscale_to_rgb: bool):
         ]
     )
 
-    # Test transform (no augmentation)
+    # Test transform (with no augmentation)
     test_base = []
     if grayscale_to_rgb and dataset.lower() in {"fashion_mnist", "mnist"}:
         test_base.append(transforms.Grayscale(num_output_channels=3))
@@ -121,40 +121,64 @@ def build_loaders(
 
 
 # Model
-def build_model(num_classes: int, pretrained: bool = True, dropout: float = 0.3):
-    # Load pretrained ResNet18 as feature extractor
-    m = models.resnet18(
-        weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-    )
+def build_model(
+    arch: str, num_classes: int, pretrained: bool = True, dropout: float = 0.3
+):
+    arch_lower = arch.lower()
 
-    # Freeze all layers initially (transfer learning approach)
-    for param in m.parameters():
-        param.requires_grad = False
+    model_map = {
+        "resnet18": (models.resnet18, models.ResNet18_Weights.IMAGENET1K_V1, "fc"),
+        "mobilenet_v2": (
+            models.mobilenet_v2,
+            models.MobileNet_V2_Weights.IMAGENET1K_V1,
+            "classifier",
+        ),
+        "efficientnet_b0": (
+            models.efficientnet_b0,
+            models.EfficientNet_B0_Weights.IMAGENET1K_V1,
+            "classifier",
+        ),
+    }
 
-    # Unfreeze layer3 and layer4 for fine tuning
-    for param in m.layer3.parameters():
-        param.requires_grad = True
-    for param in m.layer4.parameters():
-        param.requires_grad = True
+    if arch_lower in model_map:
+        model_fn, weights, classifier_attr = model_map[arch_lower]
+        m = model_fn(weights=weights if pretrained else None)
 
-    # Custom multilayr classification
-    in_feats = m.fc.in_features
-    m.fc = nn.Sequential(
-        nn.Linear(in_feats, 256),
-        nn.ReLU(),
-        nn.BatchNorm1d(256),
-        nn.Dropout(dropout),
-        nn.Linear(256, 128),
-        nn.ReLU(),
-        nn.BatchNorm1d(128),
-        nn.Dropout(dropout * 0.5),
-        nn.Linear(128, num_classes),
-    )
+        # Replace final layer with dropout for regularization
+        classifier = getattr(m, classifier_attr)
+        if isinstance(classifier, nn.Sequential):
+            in_feats = classifier[-1].in_features
+            classifier[-1] = nn.Sequential(
+                nn.Dropout(dropout), nn.Linear(in_feats, num_classes)
+            )
+        else:
+            in_feats = classifier.in_features
+            setattr(
+                m,
+                classifier_attr,
+                nn.Sequential(nn.Dropout(dropout), nn.Linear(in_feats, num_classes)),
+            )
+    else:
+        # Simple fallback CNN
+        m = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes),
+        )
 
     return m
 
 
-# Training and Evaluation
+# ----------------- Training & Evaluation -----------------
 def train_one_epoch(
     model, loader, criterion, optimizer, device, scaler=None, epoch=1, total_epochs=1
 ):
@@ -228,11 +252,12 @@ def collect_test_logits(model, loader, device):
     return np.concatenate(logits, axis=0)
 
 
-# Main
+# ----------------- Main -----------------
 def main():
     # Configuration
     student_id = "20254086"
     dataset = "fashion_mnist"
+    arch = "resnet18"
     pretrained = True
     image_size = 224
     batch_size = 64
@@ -263,19 +288,14 @@ def main():
         train_ds, test_ds, batch_size, val_split, num_workers, seed
     )
 
-    # Model with custom archit
-    model = build_model(num_classes, pretrained, dropout).to(device)
+    # Model with dropout
+    model = build_model(arch, num_classes, pretrained, dropout).to(device)
 
+    # Label smoothing for better generalization
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Only optimize trainable parameters
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    # Cosine annealing learning rate schedule
+    # Cosine annealing learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=1e-6
     )
@@ -285,7 +305,8 @@ def main():
     # Training loop with early stopping
     best_val_acc, best_state = -1.0, None
     epochs_no_improve = 0
-    print(f"\ntraining for {epochs} epochs (patience={patience})...")
+    print(f"\nTraining {arch} for {epochs} epochs (patience={patience})...")
+
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler, epoch, epochs
@@ -294,6 +315,7 @@ def main():
             model, val_loader, criterion, device, desc=f"Epoch {epoch}/{epochs} [Val]"
         )
 
+        # Learning rate scheduling
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -319,17 +341,19 @@ def main():
 
         # Early stopping
         if epochs_no_improve >= patience:
-            print(f"\nearly stop after {epoch} no improvements {patience} epochs)")
+            print(
+                f"\nEarly stopping triggered after {epoch} epochs (no improvement for {patience} epochs)"
+            )
             break
 
     # Load best model
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"\nloaded best model (val_acc={best_val_acc:.4f})")
+        print(f"\nLoaded best model (val_acc={best_val_acc:.4f})")
 
     # Test evaluation
     te_loss, te_acc = evaluate(model, test_loader, criterion, device, desc="Test")
-    print(f"test accuracy: {te_acc*100:.3f}%")
+    print(f"Test accuracy: {te_acc*100:.2f}%")
 
     # Save logits
     logits = collect_test_logits(model, test_loader, device)
@@ -338,10 +362,10 @@ def main():
     assert logits.ndim == 2 and logits.shape == (
         len(test_ds),
         num_classes,
-    ), f"expected shape ({len(test_ds)}, {num_classes}), got {logits.shape}"
+    ), f"Expected shape ({len(test_ds)}, {num_classes}), got {logits.shape}"
 
     np.save(npy_name, logits)
-    print(f"\nsaved logits to {npy_name} with shape {logits.shape}")
+    print(f"\nSaved logits to {npy_name} with shape {logits.shape}")
 
 
 if __name__ == "__main__":
